@@ -15,7 +15,7 @@ jobs:
       - name: Install deps
         run: python -m pip install --upgrade pip && pip install requests
 
-      - name: Write & run bot inline
+      - name: Write & run bot inline (always notifies)
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -29,12 +29,16 @@ jobs:
           from collections import deque
           import requests
 
+          # --- Konfigurace ---
           EQUITY_USDC=90.0; RISK_PCT=1.0; LEVERAGE=10
           LOOKBACK_SWEEP=20; ATR_MULT_STOP=1.2
           HTF="240"; LTF="15"
-          FALLBACK_COINS=["BTCUSDC","ETHUSDC","SOLUSDC","XRPUSDC","ADAUSDC","BNBUSDC","LINKUSDC","DOGEUSDC","TONUSDC","TRXUSDC"]
+          ALWAYS_NOTIFY=True  # => pošle "No signal" souhrn i když nic nenašlo
 
-          def http_get(u,p=None,t=15):
+          FALLBACK_COINS=["BTCUSDC","ETHUSDC","SOLUSDC","XRPUSDC","ADAUSDC",
+                          "BNBUSDC","LINKUSDC","DOGEUSDC","TONUSDC","TRXUSDC"]
+
+          def http_get(u,p=None,t=12):
               r=requests.get(u,params=p,timeout=t,headers={"User-Agent":"lstr-bot/1.0"})
               r.raise_for_status(); return r.json()
 
@@ -43,12 +47,14 @@ jobs:
                   cg=http_get("https://api.coingecko.com/api/v3/coins/markets",
                               {"vs_currency":"usd","order":"market_cap_desc","per_page":15,"page":1,"sparkline":"false"})
                   top=[x["symbol"].upper() for x in cg if "symbol" in x][:15]
-              except Exception: top=[]
+              except Exception:
+                  top=[]
               try:
                   info=http_get("https://api.bybit.com/v5/market/instruments-info",
                                 {"category":"linear","settleCoin":"USDC","status":"Trading"})
                   bybit={i["symbol"] for i in info.get("result",{}).get("list",[]) if i.get("symbol","").endswith("USDC")}
-              except Exception: return FALLBACK_COINS[:10]
+              except Exception:
+                  return FALLBACK_COINS[:10]
               out=[f"{t}USDC" for t in top if f"{t}USDC" in bybit][:10]
               return out or [s for s in FALLBACK_COINS if s in bybit][:10] or FALLBACK_COINS[:10]
 
@@ -102,7 +108,7 @@ jobs:
           def last(a): return a[-1] if a else math.nan
 
           def detect_signal(sym,eq,risk,lev):
-              h4d=get_ohlcv(sym,HTF,300); l15=get_ohlcv(sym,LTF,300)
+              h4d=get_ohlcv(sym,"240",300); l15=get_ohlcv(sym,"15",300)
               if len(h4d)<60 or len(l15)<60: return None
               h4=[x["high"] for x in h4d]; l4=[x["low"] for x in h4d]; c4=[x["close"] for x in h4d]
               h=[x["high"] for x in l15]; l=[x["low"] for x in l15]; c=[x["close"] for x in l15]
@@ -112,11 +118,11 @@ jobs:
               close4=last(c4); t4v=last(t4); k4v=last(k4)
               long_bias  = (not math.isnan(kumo_top) and close4>kumo_top and t4v>k4v)
               short_bias = (not math.isnan(kumo_bot) and close4<kumo_bot and t4v<k4v)
-              mn=min(l[-(LOOKBACK_SWEEP+1):-1]); mx=max(h[-(LOOKBACK_SWEEP+1):-1])
+              mn=min(l[-21:-1]); mx=max(h[-21:-1])
               last_low=l[-1]; last_high=h[-1]; entry=c[-1]; tv=last(t); kv=last(k)
               long_tr  = (last_low<mn)  and (entry>tv) and (tv>kv)
               short_tr = (last_high>mx) and (entry<tv) and (tv<kv)
-              direction = "LONG" if (long_bias and long_tr) else ("SHORT" if (short_bias and short_tr) else None)
+              direction="LONG" if (long_bias and long_tr) else ("SHORT" if (short_bias and short_tr) else None)
               if not direction: return None
               a=atr(h,l,c,14); latr=last(a)
               if direction=="LONG":
@@ -140,10 +146,12 @@ jobs:
 
           def send_telegram(text):
               tok=os.getenv("TELEGRAM_BOT_TOKEN","").strip(); cid=os.getenv("TELEGRAM_CHAT_ID","").strip()
-              if not tok or not cid: print("Missing TELEGRAM env → skip"); return
+              if not tok or not cid: 
+                  print("Missing TELEGRAM env → skip"); 
+                  return
               try:
                   requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                                json={"chat_id":cid,"text":text,"parse_mode":"Markdown"}, timeout=12)
+                                json={"chat_id":cid,"text":text,"parse_mode":"Markdown"}, timeout=10)
               except Exception as e:
                   print("Telegram error:", e)
 
@@ -152,20 +160,35 @@ jobs:
               return "\n".join([
                   f"*{s['symbol']}* | *{s['direction']}* | {now}",
                   f"Vstup `{fmt(s['entry'])}` | SL `{fmt(s['stop'])}` | TP1 `{fmt(s['tp1'])}`, TP2 `{fmt(s['tp2'])}`",
-                  f"Qty `{s['qty']}` | Notional `{fmt(s['notional'])}` USDC | Margin @10× `{fmt(s['margin'])}` USDC",
+                  f"Qty `{s['qty']}` | Notional `{fmt(s['notional'])}` USDC | Margin @{LEVERAGE}× `{fmt(s['margin'])}` USDC",
                   f"Risk `{fmt(s['risk'])}` USDC | R:R `{s['rr']:.2f}` | P&L TP1 `{fmt(s['pnl1'])}`, TP2 `{fmt(s['pnl2'])}` USDC",
                   "_OCO (TP/SL), reduce-only, trigger=Mark; po TP1 SL→BE._"
               ])
 
           def main():
+              # 1) seznam párů
               try: syms=get_top10_symbols_bybit_usdc()
               except Exception: syms=FALLBACK_COINS[:10]
+
+              # 2) projedeme páry
+              signals=[]
               for s in syms:
                   try:
                       sig=detect_signal(s,EQUITY_USDC,RISK_PCT,LEVERAGE)
-                      if sig: send_telegram(make_msg(sig))
+                      if sig:
+                          signals.append(sig)
+                          send_telegram(make_msg(sig))  # poslat hned trade setup
                   except Exception as e:
                       print(f"[{s}] chyba:", e)
+
+              # 3) souhrnná zpráva (i když nic)
+              if ALWAYS_NOTIFY:
+                  now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                  if signals:
+                      pairs=", ".join(x["symbol"] for x in signals)
+                      send_telegram(f"✅ LSTR heartbeat {now} — checked {len(syms)} pairs, signals: {len(signals)} ({pairs})")
+                  else:
+                      send_telegram(f"ℹ️ LSTR heartbeat {now} — checked {len(syms)} pairs, *no signal*")
 
           if __name__=="__main__":
               try: main()
