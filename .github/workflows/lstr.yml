@@ -1,0 +1,175 @@
+name: LSTR Signals
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'   # každých 5 min (UTC)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: python -m pip install --upgrade pip && pip install requests
+
+      - name: Write & run bot inline
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          cat > signal_bot.py <<'PY'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          import os, math, sys
+          from datetime import datetime, timezone
+          from collections import deque
+          import requests
+
+          EQUITY_USDC=90.0; RISK_PCT=1.0; LEVERAGE=10
+          LOOKBACK_SWEEP=20; ATR_MULT_STOP=1.2
+          HTF="240"; LTF="15"
+          FALLBACK_COINS=["BTCUSDC","ETHUSDC","SOLUSDC","XRPUSDC","ADAUSDC","BNBUSDC","LINKUSDC","DOGEUSDC","TONUSDC","TRXUSDC"]
+
+          def http_get(u,p=None,t=15):
+              r=requests.get(u,params=p,timeout=t,headers={"User-Agent":"lstr-bot/1.0"})
+              r.raise_for_status(); return r.json()
+
+          def get_top10_symbols_bybit_usdc():
+              try:
+                  cg=http_get("https://api.coingecko.com/api/v3/coins/markets",
+                              {"vs_currency":"usd","order":"market_cap_desc","per_page":15,"page":1,"sparkline":"false"})
+                  top=[x["symbol"].upper() for x in cg if "symbol" in x][:15]
+              except Exception: top=[]
+              try:
+                  info=http_get("https://api.bybit.com/v5/market/instruments-info",
+                                {"category":"linear","settleCoin":"USDC","status":"Trading"})
+                  bybit={i["symbol"] for i in info.get("result",{}).get("list",[]) if i.get("symbol","").endswith("USDC")}
+              except Exception: return FALLBACK_COINS[:10]
+              out=[f"{t}USDC" for t in top if f"{t}USDC" in bybit][:10]
+              return out or [s for s in FALLBACK_COINS if s in bybit][:10] or FALLBACK_COINS[:10]
+
+          def get_ohlcv(symbol,interval,limit=300):
+              j=http_get("https://api.bybit.com/v5/market/kline",
+                         {"category":"linear","symbol":symbol,"interval":interval,"limit":limit})
+              rows=j.get("result",{}).get("list",[]); ohlc=[]
+              for r in rows:
+                  ts,o,h,l,c,_v,_=r[:7]; ohlc.append({"ts":int(ts),"high":float(h),"low":float(l),"close":float(c)})
+              ohlc.sort(key=lambda x:x["ts"]); return ohlc
+
+          def sma(a,n):
+              out=[math.nan]*len(a); s=0.0
+              for i,v in enumerate(a): s+=v
+              for i in range(len(a)):
+                  if i>=n: s-=a[i-n]
+                  if i>=n-1: out[i]=s/n
+              return out
+
+          def atr(h,l,c,n=14):
+              tr=[math.nan]*len(c)
+              for i in range(len(c)):
+                  tr[i]=(h[i]-l[i]) if i==0 else max(h[i]-l[i],abs(h[i]-c[i-1]),abs(l[i]-c[i-1]))
+              return sma(tr,n)
+
+          def roll_min(a,n):
+              out=[math.nan]*len(a); dq=deque()
+              for i,v in enumerate(a):
+                  while dq and dq[-1][0]>=v: dq.pop()
+                  dq.append((v,i))
+                  while dq and dq[0][1]<=i-n: dq.popleft()
+                  out[i]=dq[0][0] if i>=n-1 else math.nan
+              return out
+
+          def roll_max(a,n):
+              out=[math.nan]*len(a); dq=deque()
+              for i,v in enumerate(a):
+                  while dq and dq[-1][0]<=v: dq.pop()
+                  dq.append((v,i))
+                  while dq and dq[0][1]<=i-n: dq.popleft()
+                  out[i]=dq[0][0] if i>=n-1 else math.nan
+              return out
+
+          def ichimoku(h,l,c,tenkan=9,kijun=26,senkou_b=52):
+              ten=[(roll_max(h,tenkan)[i]+roll_min(l,tenkan)[i])/2 for i in range(len(h))]
+              kij=[(roll_max(h,kijun)[i]+roll_min(l,kijun)[i])/2 for i in range(len(h))]
+              sb =[(roll_max(h,senkou_b)[i]+roll_min(l,senkou_b)[i])/2 for i in range(len(h))]
+              sa =[ (ten[i]+kij[i])/2 if not math.isnan(ten[i]) and not math.isnan(kij[i]) else math.nan for i in range(len(h))]
+              return ten,kij,sa,sb
+
+          def last(a): return a[-1] if a else math.nan
+
+          def detect_signal(sym,eq,risk,lev):
+              h4d=get_ohlcv(sym,HTF,300); l15=get_ohlcv(sym,LTF,300)
+              if len(h4d)<60 or len(l15)<60: return None
+              h4=[x["high"] for x in h4d]; l4=[x["low"] for x in h4d]; c4=[x["close"] for x in h4d]
+              h=[x["high"] for x in l15]; l=[x["low"] for x in l15]; c=[x["close"] for x in l15]
+              t4,k4,sa4,sb4=ichimoku(h4,l4,c4); t,k,_,_=ichimoku(h,l,c)
+              kumo_top=last([max(a,b) if not math.isnan(a) and not math.isnan(b) else math.nan for a,b in zip(sa4,sb4)])
+              kumo_bot=last([min(a,b) if not math.isnan(a) and not math.isnan(b) else math.nan for a,b in zip(sa4,sb4)])
+              close4=last(c4); t4v=last(t4); k4v=last(k4)
+              long_bias  = (not math.isnan(kumo_top) and close4>kumo_top and t4v>k4v)
+              short_bias = (not math.isnan(kumo_bot) and close4<kumo_bot and t4v<k4v)
+              mn=min(l[-(LOOKBACK_SWEEP+1):-1]); mx=max(h[-(LOOKBACK_SWEEP+1):-1])
+              last_low=l[-1]; last_high=h[-1]; entry=c[-1]; tv=last(t); kv=last(k)
+              long_tr  = (last_low<mn)  and (entry>tv) and (tv>kv)
+              short_tr = (last_high>mx) and (entry<tv) and (tv<kv)
+              direction = "LONG" if (long_bias and long_tr) else ("SHORT" if (short_bias and short_tr) else None)
+              if not direction: return None
+              a=atr(h,l,c,14); latr=last(a)
+              if direction=="LONG":
+                  stop=min(last_low, entry-(latr*ATR_MULT_STOP if not math.isnan(latr) else 0))
+                  rpu=abs(entry-stop); tp1=entry+2*rpu; tp2=entry+3*rpu
+              else:
+                  stop=max(last_high, entry+(latr*ATR_MULT_STOP if not math.isnan(latr) else 0))
+                  rpu=abs(entry-stop); tp1=entry-2*rpu; tp2=entry-3*rpu
+              if rpu<=0: return None
+              risk_usdc=eq*(risk/100.0); qty=float(f"{(risk_usdc/rpu):.4f}")
+              notional=qty*entry; margin=notional/float(lev)
+              rr=abs((tp1-entry)/(entry-stop)) if entry!=stop else float('nan')
+              pnl1=qty*abs(tp1-entry); pnl2=qty*abs(tp2-entry)
+              return {"symbol":sym,"direction":direction,"entry":entry,"stop":stop,"tp1":tp1,"tp2":tp2,
+                      "qty":qty,"notional":notional,"margin":margin,"risk":risk_usdc,"rr":rr,"pnl1":pnl1,"pnl2":pnl2}
+
+          def fmt(x):
+              if x>=100: return f"{x:.2f}"
+              elif x>=1: return f"{x:.4f}"
+              else: return f"{x:.6f}"
+
+          def send_telegram(text):
+              tok=os.getenv("TELEGRAM_BOT_TOKEN","").strip(); cid=os.getenv("TELEGRAM_CHAT_ID","").strip()
+              if not tok or not cid: print("Missing TELEGRAM env → skip"); return
+              try:
+                  requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                                json={"chat_id":cid,"text":text,"parse_mode":"Markdown"}, timeout=12)
+              except Exception as e:
+                  print("Telegram error:", e)
+
+          def make_msg(s):
+              now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+              return "\n".join([
+                  f"*{s['symbol']}* | *{s['direction']}* | {now}",
+                  f"Vstup `{fmt(s['entry'])}` | SL `{fmt(s['stop'])}` | TP1 `{fmt(s['tp1'])}`, TP2 `{fmt(s['tp2'])}`",
+                  f"Qty `{s['qty']}` | Notional `{fmt(s['notional'])}` USDC | Margin @10× `{fmt(s['margin'])}` USDC",
+                  f"Risk `{fmt(s['risk'])}` USDC | R:R `{s['rr']:.2f}` | P&L TP1 `{fmt(s['pnl1'])}`, TP2 `{fmt(s['pnl2'])}` USDC",
+                  "_OCO (TP/SL), reduce-only, trigger=Mark; po TP1 SL→BE._"
+              ])
+
+          def main():
+              try: syms=get_top10_symbols_bybit_usdc()
+              except Exception: syms=FALLBACK_COINS[:10]
+              for s in syms:
+                  try:
+                      sig=detect_signal(s,EQUITY_USDC,RISK_PCT,LEVERAGE)
+                      if sig: send_telegram(make_msg(sig))
+                  except Exception as e:
+                      print(f"[{s}] chyba:", e)
+
+          if __name__=="__main__":
+              try: main()
+              except Exception as e:
+                  print("Fatální:", e); sys.exit(1)
+          PY
+          python signal_bot.py
